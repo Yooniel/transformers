@@ -642,8 +642,8 @@ def parse_generate_flags(generate_flags: list[str] | None) -> dict:
     except json.JSONDecodeError:
         raise ValueError(
             "Failed to convert `generate_flags` into a valid JSON object."
-            "\n`generate_flags` = {generate_flags}"
-            "\nConverted JSON string = {generate_flags_string}"
+            f"\n`generate_flags` = {generate_flags}"
+            f"\nConverted JSON string = {generate_flags_string}"
         )
     return processed_generate_flags
 
