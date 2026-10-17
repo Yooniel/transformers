@@ -1190,6 +1190,22 @@ def create_sliding_window_causal_mask(
         mask_factory_function = or_masks(mask_factory_function, blockwise_overlay(block_sequence_ids))
         allow_is_causal_skip = False
 
+    # A single query at the end of a full sliding cache can attend to every cached token. For MHA, allow SDPA to
+    # skip the sliding mask and use a fused backend. Keep GQA unchanged: removing its mask can enable native GQA,
+    # which falls back to the math backend on some devices and torch versions.
+    local_size = sliding_window
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        config._attn_implementation == "sdpa"
+        and num_key_value_heads is not None
+        and num_key_value_heads == getattr(config, "num_attention_heads", None)
+        and q_length == 1
+        and kv_length == sliding_window
+        and not isinstance(q_offset, torch.Tensor)
+        and q_offset + 1 == kv_offset + kv_length
+    ):
+        local_size = None
+
     # We now create the mask
     causal_mask = mask_interface(
         batch_size=batch_size,
@@ -1200,7 +1216,7 @@ def create_sliding_window_causal_mask(
         mask_function=mask_factory_function,
         attention_mask=attention_mask,
         allow_is_causal_skip=allow_is_causal_skip,  # additional kwarg for sdpa
-        local_size=sliding_window,  # Additional kwarg for sdpa
+        local_size=local_size,  # Additional kwarg for sdpa
         dtype=dtype,  # Additional kwarg for eager
         config=config,  # Pass the config as well, in case someone wants to easily have their own mask_interface
         use_vmap=use_vmap,  # Short-circuit to non-vmap expansions for the mask
