@@ -1190,9 +1190,9 @@ def create_sliding_window_causal_mask(
         mask_factory_function = or_masks(mask_factory_function, blockwise_overlay(block_sequence_ids))
         allow_is_causal_skip = False
 
-    # A single query at the end of a full sliding cache can attend to every cached token. For MHA, allow SDPA to
-    # skip the sliding mask and use a fused backend. Keep GQA unchanged: removing its mask can enable native GQA,
-    # which falls back to the math backend on some devices and torch versions.
+    # A single query at the end of a full sliding cache can attend to every cached token, so the sliding mask is all
+    # True. For MHA, let SDPA skip it so that it can use flash attention. Keep GQA unchanged: without a mask, SDPA
+    # gets `enable_gqa=True`, which falls back to the math backend on some devices and torch versions.
     local_size = sliding_window
     num_key_value_heads = getattr(config, "num_key_value_heads", None)
     if (

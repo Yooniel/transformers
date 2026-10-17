@@ -14,6 +14,8 @@
 
 import unittest
 
+from parameterized import parameterized
+
 from transformers.testing_utils import (
     is_torch_available,
     require_torch,
@@ -28,7 +30,7 @@ if is_torch_available():
     import torch
     from torch.nn.attention.flex_attention import create_block_mask
 
-    from transformers import DynamicCache, LlamaConfig, Olmo3Config, Qwen3NextConfig, StaticCache
+    from transformers import DynamicCache, LlamaConfig, Olmo3Config, Olmo3ForCausalLM, Qwen3NextConfig, StaticCache
     from transformers.cache_utils import DynamicSlidingWindowLayer
     from transformers.masking_utils import (
         create_bidirectional_mask,
@@ -71,10 +73,9 @@ EXPECTED_PACKED_MASK = torch.tensor([[[
 
 @require_torch
 class MaskTest(MemoryCleanupMixin, unittest.TestCase):
-    def test_full_sliding_cache_decode_mask_skip(self):
-        # A full dynamic sliding cache has no invisible tokens for single-token MHA decoding. Padding, chunked
-        # decoding, static caches, custom mask functions and GQA must still retain their masks.
-        cases = [
+    @parameterized.expand(
+        [
+            # (name, prefill length, query length, kv heads, padding length, static cache, custom mask, mask skipped)
             ("window_boundary", 3, 1, 2, None, False, False, True),
             ("full_window", 4, 1, 2, None, False, False, True),
             ("padding_outside_window", 8, 1, 2, 3, False, False, True),
@@ -84,43 +85,85 @@ class MaskTest(MemoryCleanupMixin, unittest.TestCase):
             ("gqa", 4, 1, 1, None, False, False, False),
             ("custom_mask", 4, 1, 2, None, False, True, False),
         ]
-        for name, prefill_length, q_length, kv_heads, padding_length, static, custom, skip in cases:
-            with self.subTest(name=name):
-                config = Olmo3Config(
-                    hidden_size=32,
-                    num_attention_heads=2,
-                    num_key_value_heads=kv_heads,
-                    num_hidden_layers=1,
-                    sliding_window=4,
-                    layer_types=["sliding_attention"],
-                    attn_implementation="sdpa",
-                )
-                cache = StaticCache(config=config, max_cache_len=16) if static else DynamicCache(config=config)
-                states = torch.randn(2, kv_heads, prefill_length, 16, device=torch_device)
-                cache.update(states, states, 0)
-                attention_mask = None
-                if padding_length is not None:
-                    attention_mask = torch.ones(2, prefill_length + q_length, device=torch_device, dtype=torch.bool)
-                    attention_mask[0, :padding_length] = False
+    )
+    def test_full_sliding_cache_decode_mask_skip(
+        self, _, prefill_length, q_length, kv_heads, padding_length, static_cache, custom_mask, skipped
+    ):
+        # A full dynamic sliding cache has no invisible tokens for single-token MHA decoding, so the all-True sliding
+        # mask can be skipped. Padding inside the window, chunked decoding, static caches, custom mask functions and
+        # GQA must still retain their masks.
+        config = Olmo3Config(
+            hidden_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=kv_heads,
+            num_hidden_layers=1,
+            sliding_window=4,
+            layer_types=["sliding_attention"],
+            attn_implementation="sdpa",
+        )
+        cache = StaticCache(config=config, max_cache_len=16) if static_cache else DynamicCache(config=config)
+        states = torch.randn(2, kv_heads, prefill_length, 16, device=torch_device)
+        cache.update(states, states, 0)
+        attention_mask = None
+        if padding_length is not None:
+            attention_mask = torch.ones(2, prefill_length + q_length, device=torch_device, dtype=torch.bool)
+            attention_mask[0, :padding_length] = False
 
-                def exclude_even_keys(batch_idx, head_idx, q_idx, kv_idx):
-                    return kv_idx % 2 != 0
+        def exclude_even_keys(batch_idx, head_idx, q_idx, kv_idx):
+            return kv_idx % 2 != 0
 
-                mask_kwargs = {
-                    "config": config,
-                    "inputs_embeds": torch.empty(2, q_length, 32, device=torch_device),
-                    "attention_mask": attention_mask,
-                    "past_key_values": cache,
-                    "and_mask_function": exclude_even_keys if custom else None,
-                }
-                expected = create_sliding_window_causal_mask(**mask_kwargs, allow_is_causal_skip=False)
-                actual = create_sliding_window_causal_mask(**mask_kwargs)
-                if skip:
-                    self.assertIsNone(actual)
-                    self.assertTrue(expected.all())
-                else:
-                    self.assertIsNotNone(actual)
-                    torch.testing.assert_close(actual, expected)
+        mask_kwargs = {
+            "config": config,
+            "inputs_embeds": torch.empty(2, q_length, 32, device=torch_device),
+            "attention_mask": attention_mask,
+            "past_key_values": cache,
+            "and_mask_function": exclude_even_keys if custom_mask else None,
+        }
+        expected = create_sliding_window_causal_mask(**mask_kwargs, allow_is_causal_skip=False)
+        actual = create_sliding_window_causal_mask(**mask_kwargs)
+        if skipped:
+            self.assertIsNone(actual)
+            self.assertTrue(expected.all())
+        else:
+            self.assertIsNotNone(actual)
+            torch.testing.assert_close(actual, expected)
+
+    def test_full_sliding_cache_decode_matches_eager(self):
+        # Generating past a tiny window fills the sliding cache, so SDPA skips the sliding mask once the left padding
+        # has left the window. The generated tokens and logits must still match eager attention.
+        torch.manual_seed(0)
+        config = Olmo3Config(
+            vocab_size=99,
+            hidden_size=32,
+            intermediate_size=37,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            sliding_window=4,
+            layer_types=["sliding_attention", "full_attention"],
+            pad_token_id=0,
+            eos_token_id=None,
+        )
+        model = Olmo3ForCausalLM(config).to(torch_device).eval()
+        input_ids = torch.randint(1, config.vocab_size, (2, 3), device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        attention_mask[0, 0] = 0
+
+        outputs = {}
+        for attn_implementation in ("eager", "sdpa"):
+            model.set_attn_implementation(attn_implementation)
+            outputs[attn_implementation] = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=8,
+                do_sample=False,
+                output_logits=True,
+                return_dict_in_generate=True,
+            )
+        self.assertEqual(outputs["sdpa"].sequences.tolist(), outputs["eager"].sequences.tolist())
+        torch.testing.assert_close(
+            torch.stack(outputs["sdpa"].logits), torch.stack(outputs["eager"].logits), rtol=1e-4, atol=1e-4
+        )
 
     def test_packed_sequence_mask_sdpa(self):
         config = LlamaConfig()
